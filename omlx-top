@@ -615,8 +615,6 @@ def build_detail_view(
         Panel(
             info,
             title=f"[bold cyan]{name}[/]",
-            subtitle="[dim]esc back[/]",
-            subtitle_align="left",
             border_style="cyan",
             padding=(0, 2),
         )
@@ -625,6 +623,8 @@ def build_detail_view(
         Panel(
             activity_text,
             title="[bold]Recent Activity[/]",
+            subtitle="[dim]esc back[/]",
+            subtitle_align="left",
             border_style="bright_black",
             padding=(0, 1),
         )

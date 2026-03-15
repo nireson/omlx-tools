@@ -639,16 +639,14 @@ def main() -> None:
     raw_input = RawInput()
     with raw_input:
         try:
-            display, model_list = build_display(base_url, get_system_stats(), selected, detail_model)
+            sys_stats = get_system_stats()
+            display, model_list = build_display(base_url, sys_stats, selected, detail_model)
             with Live(display, console=console, refresh_per_second=2, screen=True) as live:
                 last_refresh = time.time()
                 while True:
-                    # Use a short sleep to avoid busy-waiting
                     time.sleep(0.05)
 
-                    # Poll for keypress (non-blocking)
                     key = raw_input.read_key()
-
                     needs_update = False
 
                     if key == KEY_CTRL_C:
@@ -656,9 +654,7 @@ def main() -> None:
                     elif key in (KEY_Q, KEY_ESC) and detail_model is not None:
                         detail_model = None
                         needs_update = True
-                    elif key in (KEY_Q,) and detail_model is None:
-                        break
-                    elif key == KEY_ESC and detail_model is None:
+                    elif key in (KEY_Q, KEY_ESC) and detail_model is None:
                         break
                     elif key in (KEY_UP, KEY_K) and detail_model is None:
                         if model_list:
@@ -673,18 +669,17 @@ def main() -> None:
                             detail_model = model_list[selected].get("id")
                             needs_update = True
 
-                    # Periodic refresh
+                    # Periodic data refresh (includes slow system stats)
                     now = time.time()
                     if now - last_refresh >= args.interval:
-                        needs_update = True
+                        sys_stats = get_system_stats()
                         last_refresh = now
+                        needs_update = True
 
                     if needs_update:
-                        sys_stats = get_system_stats()
                         display, model_list = build_display(
                             base_url, sys_stats, selected, detail_model,
                         )
-                        # Clamp selection to list bounds
                         if model_list:
                             selected = min(selected, len(model_list) - 1)
                         live.update(display)

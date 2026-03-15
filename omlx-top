@@ -614,7 +614,9 @@ def build_detail_view(
     layout["detail"].update(
         Panel(
             info,
-            title=f"[bold cyan]{name}[/] [dim]esc/q back[/]",
+            title=f"[bold cyan]{name}[/]",
+            subtitle="[dim]esc back[/]",
+            subtitle_align="left",
             border_style="cyan",
             padding=(0, 2),
         )

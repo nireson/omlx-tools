@@ -3,14 +3,18 @@
 #
 # Usage:
 #   omlx-add mlx-community/Qwen3-8B-4bit
-#   omlx-add mlx-community/some-new-model --restart
+#   omlx-add mlx-community/some-new-model --no-restart
+#
+# Environment variables:
+#   OMLX_MODELS_DIR  — model directory (default: ~/.omlx/models)
+#   HF_CACHE_DIR     — HuggingFace cache (default: ~/.cache/huggingface/hub)
 #
 # By default, restarts oMLX after adding. Use --no-restart to skip.
 
 set -euo pipefail
 
-MODELS_DIR="$HOME/.omlx/models"
-CACHE_DIR="$HOME/.cache/huggingface/hub"
+MODELS_DIR="${OMLX_MODELS_DIR:-$HOME/.omlx/models}"
+CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface/hub}"
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: omlx-add <model-path> [--no-restart]"
@@ -26,8 +30,8 @@ fi
 
 # Extract the short name (everything after the /)
 MODEL_NAME="${MODEL_PATH#*/}"
-# HuggingFace cache uses -- as separator
-CACHE_NAME="models--${MODEL_PATH//\//-​-}"
+
+# HuggingFace cache uses -- as separator for org/model
 CACHE_NAME="models--$(echo "$MODEL_PATH" | tr '/' '--')"
 
 echo "Downloading $MODEL_PATH..."
@@ -62,10 +66,14 @@ ln -s "$SNAPSHOT_PATH" "$MODELS_DIR/$MODEL_NAME"
 echo "Linked $MODEL_NAME -> $SNAPSHOT_PATH"
 
 if $RESTART; then
-    echo "Restarting oMLX..."
-    brew services restart jundot/omlx/omlx
-    sleep 3
-    echo "Done. Model available as: $MODEL_NAME"
+    if command -v brew &>/dev/null && brew services list 2>/dev/null | grep -q omlx; then
+        echo "Restarting oMLX..."
+        brew services restart jundot/omlx/omlx
+        sleep 3
+        echo "Done. Model available as: $MODEL_NAME"
+    else
+        echo "Done. Restart oMLX manually to make the model available."
+    fi
 else
-    echo "Done. Restart oMLX to make the model available: brew services restart jundot/omlx/omlx"
+    echo "Done. Restart oMLX to make the model available."
 fi

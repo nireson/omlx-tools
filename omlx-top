@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""omlx-top — live TUI dashboard for oMLX server."""
+
+import argparse
+import plistlib
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+import json
+from datetime import timedelta
+from pathlib import Path
+
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.text import Text
+from rich import box
+
+
+def fetch_json(url: str, timeout: float = 2.0):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def fmt_bytes(n: int) -> str:
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.1f} GB"
+    if n >= 1 << 20:
+        return f"{n / (1 << 20):.0f} MB"
+    return f"{n} B"
+
+
+def fmt_duration(seconds: float) -> str:
+    d = timedelta(seconds=int(seconds))
+    days = d.days
+    hours, rem = divmod(d.seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {mins}m"
+    if hours > 0:
+        return f"{hours}h {mins}m {secs}s"
+    return f"{mins}m {secs}s"
+
+
+def fmt_tps(tps: float) -> str:
+    if tps == 0:
+        return "-"
+    return f"{tps:.1f}"
+
+
+def make_bar(pct: float, width: int = 20, thresholds=(60, 85)) -> Text:
+    filled = int(width * pct / 100)
+    color = "green" if pct < thresholds[0] else "yellow" if pct < thresholds[1] else "red"
+    bar = Text()
+    bar.append("[")
+    bar.append("█" * filled, style=color)
+    bar.append("░" * (width - filled), style="bright_black")
+    bar.append(f"] {pct:.0f}%")
+    return bar
+
+
+def get_system_stats() -> dict:
+    """Get CPU, GPU, and memory stats from macOS APIs."""
+    stats = {}
+
+    # CPU usage via top (single snapshot)
+    try:
+        r = subprocess.run(
+            ["top", "-l", "1", "-n", "0", "-s", "0"],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in r.stdout.split("\n"):
+            if "CPU usage" in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == "user,":
+                        stats["cpu_user"] = float(parts[i - 1].rstrip("%"))
+                    elif p == "sys,":
+                        stats["cpu_sys"] = float(parts[i - 1].rstrip("%"))
+                    elif p == "idle":
+                        stats["cpu_idle"] = float(parts[i - 1].rstrip("%"))
+                stats["cpu_used"] = round(
+                    stats.get("cpu_user", 0) + stats.get("cpu_sys", 0), 1
+                )
+                break
+    except Exception:
+        pass
+
+    # GPU utilization via ioreg
+    try:
+        r = subprocess.run(
+            ["ioreg", "-r", "-d", "1", "-c", "AGXAccelerator", "-a"],
+            capture_output=True, timeout=3,
+        )
+        data = plistlib.loads(r.stdout)
+        for item in data:
+            ps = item.get("PerformanceStatistics", {})
+            if ps:
+                stats["gpu_util"] = ps.get("Device Utilization %", 0)
+                stats["gpu_renderer"] = ps.get("Renderer Utilization %", 0)
+                stats["gpu_tiler"] = ps.get("Tiler Utilization %", 0)
+                stats["gpu_alloc"] = ps.get("Alloc system memory", 0)
+                stats["gpu_in_use"] = ps.get("In use system memory", 0)
+                break
+    except Exception:
+        pass
+
+    # System memory via vm_stat
+    try:
+        r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3)
+        page_size = 16384  # Apple Silicon default
+        pages = {}
+        for line in r.stdout.split("\n"):
+            if "page size of" in line:
+                page_size = int(line.split()[-2])
+            for key in ("free", "active", "inactive", "wired", "compressor"):
+                if key in line.lower() and ":" in line:
+                    val = line.split(":")[1].strip().rstrip(".")
+                    pages[key] = int(val)
+        total_pages = sum(pages.values())
+        used_pages = pages.get("active", 0) + pages.get("wired", 0)
+        stats["ram_total"] = total_pages * page_size
+        stats["ram_used"] = used_pages * page_size
+        stats["ram_pct"] = round(used_pages / total_pages * 100, 1) if total_pages else 0
+    except Exception:
+        pass
+
+    return stats
+
+
+def load_model_stats() -> dict:
+    """Load per-model stats from oMLX's persisted stats file."""
+    stats_path = Path.home() / ".omlx" / "stats.json"
+    try:
+        with open(stats_path) as f:
+            data = json.load(f)
+        return data.get("per_model", {})
+    except Exception:
+        return {}
+
+
+def build_display(base_url: str, sys_stats: dict) -> Layout:
+    status = fetch_json(f"{base_url}/api/status")
+    models = fetch_json(f"{base_url}/v1/models/status")
+    model_perf = load_model_stats()
+
+    if not status:
+        return Panel(
+            Text("Cannot connect to oMLX server", style="bold red", justify="center"),
+            title="omlx-top",
+            border_style="red",
+        )
+
+    # --- Header row ---
+    header = Table(show_header=False, box=None, padding=(0, 2), expand=True)
+    header.add_column(ratio=1)
+    header.add_column(ratio=1)
+    header.add_column(ratio=1)
+
+    version = status.get("version", "?")
+    uptime = fmt_duration(status.get("uptime_seconds", 0))
+    loaded = status.get("models_loaded", 0)
+    discovered = status.get("models_discovered", 0)
+
+    col1 = Text()
+    col1.append("oMLX ", style="bold cyan")
+    col1.append(f"v{version}", style="dim")
+    col1.append(f"  up {uptime}", style="green")
+
+    col2 = Text()
+    col2.append("Models: ", style="dim")
+    col2.append(f"{loaded}", style="bold green" if loaded > 0 else "bold yellow")
+    col2.append(f"/{discovered} loaded", style="dim")
+
+    col3 = Text()
+    col3.append("Requests: ", style="dim")
+    col3.append(str(status.get("total_requests", 0)), style="bold")
+    active = status.get("active_requests", 0)
+    if active > 0:
+        col3.append(f"  active: {active}", style="bold yellow")
+    waiting = status.get("waiting_requests", 0)
+    if waiting > 0:
+        col3.append(f"  queued: {waiting}", style="bold red")
+
+    header.add_row(col1, col2, col3)
+
+    # --- Throughput row ---
+    throughput = Table(show_header=False, box=None, padding=(0, 2), expand=True)
+    throughput.add_column(ratio=1)
+    throughput.add_column(ratio=1)
+    throughput.add_column(ratio=1)
+
+    prefill = Text()
+    prefill.append("Prefill: ", style="dim")
+    prefill.append(fmt_tps(status.get("avg_prefill_tps", 0)), style="bold")
+    prefill.append(" tok/s", style="dim")
+
+    gen = Text()
+    gen.append("Generate: ", style="dim")
+    gen.append(fmt_tps(status.get("avg_generation_tps", 0)), style="bold")
+    gen.append(" tok/s", style="dim")
+
+    tokens = Text()
+    tokens.append("Tokens: ", style="dim")
+    tokens.append(f"{status.get('total_prompt_tokens', 0):,}", style="bold")
+    tokens.append(" in ", style="dim")
+    tokens.append(f"{status.get('total_completion_tokens', 0):,}", style="bold")
+    tokens.append(" out", style="dim")
+
+    throughput.add_row(prefill, gen, tokens)
+
+    # --- System bars ---
+    bars = Table(show_header=False, box=None, padding=(0, 2), expand=True)
+    bars.add_column(ratio=1)
+    bars.add_column(ratio=1)
+
+    # Model memory bar
+    mem_used = status.get("model_memory_used", 0)
+    mem_max = status.get("model_memory_max", 1)
+    mem_pct = mem_used / mem_max * 100 if mem_max else 0
+    used_fmt = status.get("model_memory_used_formatted", "?").replace(" ", "")
+    max_fmt = status.get("model_memory_max_formatted", "?").replace(" ", "")
+    model_mem_row = Text()
+    model_mem_row.append("Models ", style="dim")
+    model_mem_row.append_text(make_bar(mem_pct, width=16))
+    model_mem_row.append(f" {used_fmt}", style="bold")
+    model_mem_row.append(f"/{max_fmt}", style="dim")
+
+    # GPU bar
+    gpu_pct = sys_stats.get("gpu_util", 0)
+    gpu_row = Text()
+    gpu_row.append("GPU    ", style="dim")
+    gpu_row.append_text(make_bar(gpu_pct, width=16))
+    gpu_alloc = sys_stats.get("gpu_alloc", 0)
+    if gpu_alloc:
+        gpu_row.append(f" {fmt_bytes(gpu_alloc)}", style="dim")
+
+    bars.add_row(model_mem_row, gpu_row)
+
+    # CPU bar + System RAM bar
+    cpu_pct = sys_stats.get("cpu_used", 0)
+    cpu_row = Text()
+    cpu_row.append("CPU    ", style="dim")
+    cpu_row.append_text(make_bar(cpu_pct, width=16))
+    cpu_row.append(f" {sys_stats.get('cpu_user', 0):.0f}%u {sys_stats.get('cpu_sys', 0):.0f}%s", style="dim")
+
+    ram_pct = sys_stats.get("ram_pct", 0)
+    ram_row = Text()
+    ram_row.append("RAM    ", style="dim")
+    ram_row.append_text(make_bar(ram_pct, width=16))
+    ram_used = sys_stats.get("ram_used", 0)
+    ram_total = sys_stats.get("ram_total", 0)
+    if ram_total:
+        ram_row.append(f" {fmt_bytes(ram_used)}", style="bold")
+        ram_row.append(f"/{fmt_bytes(ram_total)}", style="dim")
+
+    bars.add_row(cpu_row, ram_row)
+
+    # --- Models table ---
+    model_table = Table(
+        box=box.SIMPLE_HEAVY,
+        expand=True,
+        show_edge=False,
+        pad_edge=False,
+        header_style="bold bright_white",
+    )
+    model_table.add_column("Model", style="bold", ratio=3)
+    model_table.add_column("Status", justify="center")
+    model_table.add_column("Size", justify="right")
+    model_table.add_column("Reqs", justify="right")
+    model_table.add_column("Prefill", justify="right")
+    model_table.add_column("Gen", justify="right")
+    model_table.add_column("Tokens", justify="right")
+    model_table.add_column("Last Access", justify="right")
+
+    if models and "models" in models:
+        for m in models["models"]:
+            name = m.get("id", "?")
+            is_loaded = m.get("loaded", False)
+            loading = m.get("is_loading", False)
+            pinned = m.get("pinned", False)
+            size = fmt_bytes(m.get("estimated_size", 0))
+            last = m.get("last_access")
+
+            if loading:
+                status_text = Text("⟳ loading", style="bold yellow")
+            elif is_loaded and pinned:
+                status_text = Text("● pinned", style="bold cyan")
+            elif is_loaded:
+                status_text = Text("● loaded", style="bold green")
+            else:
+                status_text = Text("○ idle", style="dim")
+
+            name_style = "bold white" if is_loaded else "dim"
+            size_style = "bold" if is_loaded else "dim"
+            dim = "dim" if not is_loaded else ""
+
+            if last:
+                elapsed = time.time() - last
+                last_str = fmt_duration(elapsed) + " ago"
+            else:
+                last_str = "-"
+
+            # Per-model performance from stats
+            perf = model_perf.get(name, {})
+            reqs = perf.get("requests", 0)
+            pt = perf.get("prompt_tokens", 0)
+            ct = perf.get("completion_tokens", 0)
+            cached = perf.get("cached_tokens", 0)
+            pd = perf.get("prefill_duration", 0)
+            gd = perf.get("generation_duration", 0)
+
+            prefill_tps = (pt - cached) / pd if pd > 0 else 0
+            gen_tps = ct / gd if gd > 0 else 0
+
+            reqs_str = str(reqs) if reqs else "-"
+            prefill_str = f"{prefill_tps:.0f} t/s" if prefill_tps else "-"
+            gen_str = f"{gen_tps:.0f} t/s" if gen_tps else "-"
+            tokens_str = f"{(pt + ct):,}" if (pt + ct) else "-"
+
+            model_table.add_row(
+                Text(name, style=name_style),
+                status_text,
+                Text(size, style=size_style),
+                Text(reqs_str, style=dim),
+                Text(prefill_str, style=dim),
+                Text(gen_str, style=dim),
+                Text(tokens_str, style=dim),
+                Text(last_str, style=dim),
+            )
+
+    # --- Compose layout ---
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=10),
+        Layout(name="models"),
+    )
+
+    top_group = Table(show_header=False, box=None, padding=0, expand=True)
+    top_group.add_column()
+    top_group.add_row(header)
+    top_group.add_row(throughput)
+    top_group.add_row(Text())  # spacer
+    top_group.add_row(bars)
+
+    layout["header"].update(
+        Panel(top_group, title="[bold cyan]omlx-top[/]", border_style="cyan", padding=(0, 1))
+    )
+    layout["models"].update(
+        Panel(model_table, title="[bold]Models[/]", border_style="bright_black", padding=(0, 1))
+    )
+
+    return layout
+
+
+def main():
+    parser = argparse.ArgumentParser(description="omlx-top — live dashboard for oMLX server")
+    parser.add_argument("--url", default="http://localhost:11435", help="oMLX server URL")
+    parser.add_argument("-n", "--interval", type=float, default=2.0, help="Refresh interval in seconds")
+    args = parser.parse_args()
+
+    console = Console()
+    base_url = args.url.rstrip("/")
+
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    try:
+        with Live(
+            build_display(base_url, get_system_stats()),
+            console=console,
+            refresh_per_second=1,
+            screen=True,
+        ) as live:
+            while True:
+                time.sleep(args.interval)
+                sys_stats = get_system_stats()
+                live.update(build_display(base_url, sys_stats))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

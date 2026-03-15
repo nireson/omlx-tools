@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# omlx-add — download an MLX model and add it to oMLX
+#
+# Usage:
+#   omlx-add mlx-community/Qwen3-8B-4bit
+#   omlx-add mlx-community/some-new-model --restart
+#
+# By default, restarts oMLX after adding. Use --no-restart to skip.
+
+set -euo pipefail
+
+MODELS_DIR="$HOME/.omlx/models"
+CACHE_DIR="$HOME/.cache/huggingface/hub"
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: omlx-add <model-path> [--no-restart]"
+    echo "  e.g. omlx-add mlx-community/Qwen3-8B-4bit"
+    exit 1
+fi
+
+MODEL_PATH="$1"
+RESTART=true
+if [[ "${2:-}" == "--no-restart" ]]; then
+    RESTART=false
+fi
+
+# Extract the short name (everything after the /)
+MODEL_NAME="${MODEL_PATH#*/}"
+# HuggingFace cache uses -- as separator
+CACHE_NAME="models--${MODEL_PATH//\//-​-}"
+CACHE_NAME="models--$(echo "$MODEL_PATH" | tr '/' '--')"
+
+echo "Downloading $MODEL_PATH..."
+hf download "$MODEL_PATH"
+
+# Find the snapshot hash
+SNAPSHOTS_DIR="$CACHE_DIR/$CACHE_NAME/snapshots"
+if [[ ! -d "$SNAPSHOTS_DIR" ]]; then
+    echo "Error: snapshot directory not found at $SNAPSHOTS_DIR"
+    exit 1
+fi
+
+HASH=$(ls "$SNAPSHOTS_DIR" | head -1)
+if [[ -z "$HASH" ]]; then
+    echo "Error: no snapshot found"
+    exit 1
+fi
+
+SNAPSHOT_PATH="$SNAPSHOTS_DIR/$HASH"
+
+# Create symlink
+mkdir -p "$MODELS_DIR"
+if [[ -L "$MODELS_DIR/$MODEL_NAME" ]]; then
+    echo "Updating existing symlink for $MODEL_NAME"
+    rm "$MODELS_DIR/$MODEL_NAME"
+elif [[ -e "$MODELS_DIR/$MODEL_NAME" ]]; then
+    echo "Error: $MODELS_DIR/$MODEL_NAME exists and is not a symlink"
+    exit 1
+fi
+
+ln -s "$SNAPSHOT_PATH" "$MODELS_DIR/$MODEL_NAME"
+echo "Linked $MODEL_NAME -> $SNAPSHOT_PATH"
+
+if $RESTART; then
+    echo "Restarting oMLX..."
+    brew services restart jundot/omlx/omlx
+    sleep 3
+    echo "Done. Model available as: $MODEL_NAME"
+else
+    echo "Done. Restart oMLX to make the model available: brew services restart jundot/omlx/omlx"
+fi

@@ -2,15 +2,23 @@
 """omlx-top — live TUI dashboard for oMLX server.
 
 Requires macOS (Apple Silicon) and the ``rich`` Python package.
+
+Controls:
+  Up/Down or j/k  — select model
+  Enter            — show model detail view
+  Escape or q      — back to main view / quit
 """
 
 import argparse
 import json
 import os
 import plistlib
+import select
 import subprocess
 import sys
+import termios
 import time
+import tty
 import urllib.request
 from datetime import timedelta
 from pathlib import Path
@@ -49,7 +57,7 @@ def fmt_bytes(n: int) -> str:
 
 def fmt_duration(seconds: float) -> str:
     """Format a duration in seconds as a compact human-readable string."""
-    seconds = max(0, seconds)  # guard against negative values
+    seconds = max(0, seconds)
     d = timedelta(seconds=int(seconds))
     days = d.days
     hours, rem = divmod(d.seconds, 3600)
@@ -70,7 +78,7 @@ def fmt_tps(tps: float) -> str:
 
 def make_bar(pct: float, width: int = 20, thresholds: tuple = (60, 85)) -> Text:
     """Render a progress bar as a Rich ``Text`` object."""
-    pct = max(0.0, min(100.0, pct))  # clamp to 0-100
+    pct = max(0.0, min(100.0, pct))
     filled = int(width * pct / 100)
     color = "green" if pct < thresholds[0] else "yellow" if pct < thresholds[1] else "red"
     bar = Text()
@@ -82,18 +90,58 @@ def make_bar(pct: float, width: int = 20, thresholds: tuple = (60, 85)) -> Text:
 
 
 # ---------------------------------------------------------------------------
+# Keyboard input (non-blocking)
+# ---------------------------------------------------------------------------
+
+class RawInput:
+    """Non-blocking keyboard reader using raw terminal mode."""
+
+    def __init__(self):
+        self._fd = sys.stdin.fileno()
+        self._old_settings = None
+
+    def __enter__(self):
+        self._old_settings = termios.tcgetattr(self._fd)
+        tty.setraw(self._fd)
+        return self
+
+    def __exit__(self, *_):
+        if self._old_settings:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
+
+    def read_key(self) -> str | None:
+        """Read a keypress if available. Returns None if no key is pending."""
+        if not select.select([sys.stdin], [], [], 0)[0]:
+            return None
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            # Escape sequence (arrow keys, etc.)
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                ch += sys.stdin.read(1)
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    ch += sys.stdin.read(1)
+            return ch
+        return ch
+
+
+KEY_UP = "\x1b[A"
+KEY_DOWN = "\x1b[B"
+KEY_ENTER = "\r"
+KEY_ESC = "\x1b"
+KEY_Q = "q"
+KEY_J = "j"
+KEY_K = "k"
+KEY_CTRL_C = "\x03"
+
+
+# ---------------------------------------------------------------------------
 # System stats (macOS-only)
 # ---------------------------------------------------------------------------
 
 def get_system_stats() -> dict[str, Any]:
-    """Collect CPU, GPU, and memory stats from macOS APIs.
-
-    Returns a dict with best-effort values; missing keys indicate that the
-    corresponding data source was unavailable.
-    """
+    """Collect CPU, GPU, and memory stats from macOS APIs."""
     stats: dict[str, Any] = {}
 
-    # CPU usage via top (single snapshot)
     try:
         r = subprocess.run(
             ["top", "-l", "1", "-n", "0", "-s", "0"],
@@ -116,7 +164,6 @@ def get_system_stats() -> dict[str, Any]:
     except Exception:
         pass
 
-    # GPU utilization via ioreg
     try:
         r = subprocess.run(
             ["ioreg", "-r", "-d", "1", "-c", "AGXAccelerator", "-a"],
@@ -132,7 +179,6 @@ def get_system_stats() -> dict[str, Any]:
     except Exception:
         pass
 
-    # System memory — prefer sysctl for total, vm_stat for breakdown
     try:
         page_size = os.sysconf("SC_PAGE_SIZE")
         r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3)
@@ -143,14 +189,10 @@ def get_system_stats() -> dict[str, Any]:
                     val = line.split(":")[1].strip().rstrip(".")
                     pages[key] = int(val)
         used_pages = (
-            pages.get("active", 0)
-            + pages.get("wired", 0)
-            + pages.get("compressor", 0)
+            pages.get("active", 0) + pages.get("wired", 0) + pages.get("compressor", 0)
         )
-        # Total RAM from sysctl (more reliable than summing vm_stat categories)
         r2 = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
-            capture_output=True, text=True, timeout=3,
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3,
         )
         total_bytes = int(r2.stdout.strip())
         used_bytes = used_pages * page_size
@@ -175,27 +217,24 @@ def load_model_stats() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Display
+# Model list helper
 # ---------------------------------------------------------------------------
 
-def build_display(base_url: str, sys_stats: dict[str, Any]) -> Union[Layout, Panel]:
-    """Build the full dashboard layout for one refresh cycle."""
-    status = fetch_json(f"{base_url}/api/status")
-    models = fetch_json(f"{base_url}/v1/models/status")
-    model_perf = load_model_stats()
+def get_model_list(models_data: dict | None) -> list[dict]:
+    """Extract the model list from the /v1/models/status response."""
+    if models_data and "models" in models_data:
+        return models_data["models"]
+    return []
 
-    if not status:
-        return Panel(
-            Text(
-                f"Cannot connect to oMLX server at {base_url}",
-                style="bold red",
-                justify="center",
-            ),
-            title="omlx-top",
-            border_style="red",
-        )
 
-    # --- Header row ---
+# ---------------------------------------------------------------------------
+# Header (shared between main and detail views)
+# ---------------------------------------------------------------------------
+
+def build_header(
+    status: dict, sys_stats: dict[str, Any],
+) -> Panel:
+    """Build the shared header panel with server info and system bars."""
     header = Table(show_header=False, box=None, padding=(0, 2), expand=True)
     header.add_column(ratio=1)
     header.add_column(ratio=1)
@@ -228,7 +267,7 @@ def build_display(base_url: str, sys_stats: dict[str, Any]) -> Union[Layout, Pan
 
     header.add_row(col1, col2, col3)
 
-    # --- Throughput row ---
+    # Throughput row
     throughput = Table(show_header=False, box=None, padding=(0, 2), expand=True)
     throughput.add_column(ratio=1)
     throughput.add_column(ratio=1)
@@ -250,10 +289,13 @@ def build_display(base_url: str, sys_stats: dict[str, Any]) -> Union[Layout, Pan
     tokens.append(" in ", style="dim")
     tokens.append(f"{status.get('total_completion_tokens', 0):,}", style="bold")
     tokens.append(" out", style="dim")
+    cache_eff = status.get("cache_efficiency", 0)
+    if cache_eff > 0:
+        tokens.append(f"  cache: {cache_eff:.0f}%", style="cyan")
 
     throughput.add_row(prefill, gen, tokens)
 
-    # --- System bars ---
+    # System bars
     bars = Table(show_header=False, box=None, padding=(0, 2), expand=True)
     bars.add_column(ratio=1)
     bars.add_column(ratio=1)
@@ -297,7 +339,30 @@ def build_display(base_url: str, sys_stats: dict[str, Any]) -> Union[Layout, Pan
 
     bars.add_row(cpu_row, ram_row)
 
-    # --- Models table ---
+    top_group = Table(show_header=False, box=None, padding=0, expand=True)
+    top_group.add_column()
+    top_group.add_row(header)
+    top_group.add_row(throughput)
+    top_group.add_row(Text())
+    top_group.add_row(bars)
+
+    return Panel(
+        top_group, title="[bold cyan]omlx-top[/]", border_style="cyan", padding=(0, 1),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main view (model table with selection)
+# ---------------------------------------------------------------------------
+
+def build_main_view(
+    status: dict,
+    model_list: list[dict],
+    model_perf: dict,
+    sys_stats: dict[str, Any],
+    selected: int,
+) -> Layout:
+    """Build the main dashboard with selectable model table."""
     model_table = Table(
         box=box.SIMPLE_HEAVY,
         expand=True,
@@ -305,6 +370,7 @@ def build_display(base_url: str, sys_stats: dict[str, Any]) -> Union[Layout, Pan
         pad_edge=False,
         header_style="bold bright_white",
     )
+    model_table.add_column("", width=2)  # selector
     model_table.add_column("Model", style="bold", ratio=3)
     model_table.add_column("Status", justify="center")
     model_table.add_column("Size", justify="right")
@@ -314,84 +380,220 @@ def build_display(base_url: str, sys_stats: dict[str, Any]) -> Union[Layout, Pan
     model_table.add_column("Tokens", justify="right")
     model_table.add_column("Last Access", justify="right")
 
-    if models and "models" in models:
-        for m in models["models"]:
-            name = m.get("id", "?")
-            is_loaded = m.get("loaded", False)
-            loading = m.get("is_loading", False)
-            pinned = m.get("pinned", False)
-            size = fmt_bytes(m.get("estimated_size", 0))
-            last = m.get("last_access")
+    for idx, m in enumerate(model_list):
+        name = m.get("id", "?")
+        is_loaded = m.get("loaded", False)
+        loading = m.get("is_loading", False)
+        pinned = m.get("pinned", False)
+        size = fmt_bytes(m.get("estimated_size", 0))
+        last = m.get("last_access")
+        is_selected = idx == selected
 
-            if loading:
-                status_text = Text("⟳ loading", style="bold yellow")
-            elif is_loaded and pinned:
-                status_text = Text("● pinned", style="bold cyan")
-            elif is_loaded:
-                status_text = Text("● loaded", style="bold green")
-            else:
-                status_text = Text("○ idle", style="dim")
+        if loading:
+            status_text = Text("⟳ loading", style="bold yellow")
+        elif is_loaded and pinned:
+            status_text = Text("● pinned", style="bold cyan")
+        elif is_loaded:
+            status_text = Text("● loaded", style="bold green")
+        else:
+            status_text = Text("○ idle", style="dim")
 
-            name_style = "bold white" if is_loaded else "dim"
-            size_style = "bold" if is_loaded else "dim"
-            row_style = "dim" if not is_loaded else None
+        name_style = "bold white" if is_loaded else "dim"
+        size_style = "bold" if is_loaded else "dim"
+        row_style = "dim" if not is_loaded else None
 
-            if isinstance(last, (int, float)):
-                elapsed = max(0, time.time() - last)
-                last_str = fmt_duration(elapsed) + " ago"
-            else:
-                last_str = "-"
+        if is_selected:
+            selector = Text("▸", style="bold cyan")
+            name_style = "bold cyan" if not is_loaded else "bold cyan"
+        else:
+            selector = Text(" ")
 
-            # Per-model performance from stats
-            perf = model_perf.get(name, {})
-            reqs = perf.get("requests", 0)
-            pt = perf.get("prompt_tokens", 0)
-            ct = perf.get("completion_tokens", 0)
-            cached = perf.get("cached_tokens", 0)
-            pd = perf.get("prefill_duration", 0)
-            gd = perf.get("generation_duration", 0)
+        if isinstance(last, (int, float)):
+            elapsed = max(0, time.time() - last)
+            last_str = fmt_duration(elapsed) + " ago"
+        else:
+            last_str = "-"
 
-            prefill_tps = (pt - cached) / pd if pd > 0 else 0
-            gen_tps = ct / gd if gd > 0 else 0
+        perf = model_perf.get(name, {})
+        reqs = perf.get("requests", 0)
+        pt = perf.get("prompt_tokens", 0)
+        ct = perf.get("completion_tokens", 0)
+        cached = perf.get("cached_tokens", 0)
+        pd = perf.get("prefill_duration", 0)
+        gd = perf.get("generation_duration", 0)
 
-            reqs_str = str(reqs) if reqs else "-"
-            prefill_str = f"{prefill_tps:.0f} t/s" if prefill_tps else "-"
-            gen_str = f"{gen_tps:.0f} t/s" if gen_tps else "-"
-            tokens_str = f"{(pt + ct):,}" if (pt + ct) else "-"
+        prefill_tps = (pt - cached) / pd if pd > 0 else 0
+        gen_tps = ct / gd if gd > 0 else 0
 
-            model_table.add_row(
-                Text(name, style=name_style),
-                status_text,
-                Text(size, style=size_style),
-                Text(reqs_str, style=row_style),
-                Text(prefill_str, style=row_style),
-                Text(gen_str, style=row_style),
-                Text(tokens_str, style=row_style),
-                Text(last_str, style=row_style),
-            )
+        reqs_str = str(reqs) if reqs else "-"
+        prefill_str = f"{prefill_tps:.0f} t/s" if prefill_tps else "-"
+        gen_str = f"{gen_tps:.0f} t/s" if gen_tps else "-"
+        tokens_str = f"{(pt + ct):,}" if (pt + ct) else "-"
 
-    # --- Compose layout ---
+        model_table.add_row(
+            selector,
+            Text(name, style=name_style),
+            status_text,
+            Text(size, style=size_style),
+            Text(reqs_str, style=row_style),
+            Text(prefill_str, style=row_style),
+            Text(gen_str, style=row_style),
+            Text(tokens_str, style=row_style),
+            Text(last_str, style=row_style),
+        )
+
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=10),
         Layout(name="models"),
     )
-
-    top_group = Table(show_header=False, box=None, padding=0, expand=True)
-    top_group.add_column()
-    top_group.add_row(header)
-    top_group.add_row(throughput)
-    top_group.add_row(Text())  # spacer
-    top_group.add_row(bars)
-
-    layout["header"].update(
-        Panel(top_group, title="[bold cyan]omlx-top[/]", border_style="cyan", padding=(0, 1))
-    )
+    layout["header"].update(build_header(status, sys_stats))
     layout["models"].update(
-        Panel(model_table, title="[bold]Models[/]", border_style="bright_black", padding=(0, 1))
+        Panel(
+            model_table,
+            title="[bold]Models[/] [dim]↑↓ select  ⏎ detail  q quit[/]",
+            border_style="bright_black",
+            padding=(0, 1),
+        )
     )
-
     return layout
+
+
+# ---------------------------------------------------------------------------
+# Detail view
+# ---------------------------------------------------------------------------
+
+def build_detail_view(
+    status: dict,
+    model: dict,
+    model_perf: dict,
+    sys_stats: dict[str, Any],
+) -> Layout:
+    """Build a detail view for a single model."""
+    name = model.get("id", "?")
+    is_loaded = model.get("loaded", False)
+    loading = model.get("is_loading", False)
+    pinned = model.get("pinned", False)
+
+    # Status
+    if loading:
+        status_str = "Loading..."
+        status_style = "bold yellow"
+    elif is_loaded and pinned:
+        status_str = "Loaded (pinned)"
+        status_style = "bold cyan"
+    elif is_loaded:
+        status_str = "Loaded"
+        status_style = "bold green"
+    else:
+        status_str = "Idle (not loaded)"
+        status_style = "dim"
+
+    # Info table
+    info = Table(show_header=False, box=None, padding=(0, 2), expand=True)
+    info.add_column("Key", style="dim", width=20)
+    info.add_column("Value")
+
+    info.add_row("Status", Text(status_str, style=status_style))
+    info.add_row("Architecture", model.get("config_model_type", "?"))
+    info.add_row("Engine", model.get("engine_type", "?"))
+    info.add_row("Type", model.get("model_type", "?"))
+    info.add_row("Estimated Size", fmt_bytes(model.get("estimated_size", 0)))
+    info.add_row("Pinned", "Yes" if pinned else "No")
+
+    last = model.get("last_access")
+    if isinstance(last, (int, float)):
+        info.add_row("Last Access", fmt_duration(max(0, time.time() - last)) + " ago")
+    else:
+        info.add_row("Last Access", "-")
+
+    # Performance stats
+    perf = model_perf.get(name, {})
+    reqs = perf.get("requests", 0)
+    pt = perf.get("prompt_tokens", 0)
+    ct = perf.get("completion_tokens", 0)
+    cached = perf.get("cached_tokens", 0)
+    pd = perf.get("prefill_duration", 0)
+    gd = perf.get("generation_duration", 0)
+
+    prefill_tps = (pt - cached) / pd if pd > 0 else 0
+    gen_tps = ct / gd if gd > 0 else 0
+
+    info.add_row("", "")  # spacer
+    info.add_row(Text("Performance", style="bold bright_white"), "")
+    info.add_row("Requests", str(reqs) if reqs else "-")
+    info.add_row("Prompt Tokens", f"{pt:,}" if pt else "-")
+    info.add_row("Completion Tokens", f"{ct:,}" if ct else "-")
+    info.add_row("Cached Tokens", f"{cached:,}" if cached else "-")
+    if pt > 0 and cached > 0:
+        info.add_row("Cache Hit Rate", f"{cached / pt * 100:.1f}%")
+    info.add_row("Avg Prefill", f"{prefill_tps:.1f} tok/s" if prefill_tps else "-")
+    info.add_row("Avg Generation", f"{gen_tps:.1f} tok/s" if gen_tps else "-")
+    if pd > 0:
+        info.add_row("Total Prefill Time", f"{pd:.1f}s")
+    if gd > 0:
+        info.add_row("Total Gen Time", f"{gd:.1f}s")
+    if reqs > 0 and ct > 0:
+        avg_tokens = ct / reqs
+        info.add_row("Avg Tokens/Request", f"{avg_tokens:.0f}")
+
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=10),
+        Layout(name="detail"),
+    )
+    layout["header"].update(build_header(status, sys_stats))
+    layout["detail"].update(
+        Panel(
+            info,
+            title=f"[bold cyan]{name}[/] [dim]esc/q back[/]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
+    return layout
+
+
+# ---------------------------------------------------------------------------
+# Display dispatcher
+# ---------------------------------------------------------------------------
+
+def build_display(
+    base_url: str,
+    sys_stats: dict[str, Any],
+    selected: int = 0,
+    detail_model: str | None = None,
+) -> tuple[Union[Layout, Panel], list[dict]]:
+    """Build the display and return (renderable, model_list).
+
+    Returns the model list so the caller can track selection bounds.
+    """
+    status = fetch_json(f"{base_url}/api/status")
+    models_data = fetch_json(f"{base_url}/v1/models/status")
+    model_perf = load_model_stats()
+    model_list = get_model_list(models_data)
+
+    if not status:
+        panel = Panel(
+            Text(
+                f"Cannot connect to oMLX server at {base_url}",
+                style="bold red",
+                justify="center",
+            ),
+            title="omlx-top",
+            border_style="red",
+        )
+        return panel, []
+
+    if detail_model is not None:
+        # Find the model in the list
+        model = next((m for m in model_list if m.get("id") == detail_model), None)
+        if model:
+            return build_detail_view(status, model, model_perf, sys_stats), model_list
+        # Model not found — fall back to main view
+        detail_model = None
+
+    return build_main_view(status, model_list, model_perf, sys_stats, selected), model_list
 
 
 # ---------------------------------------------------------------------------
@@ -423,18 +625,76 @@ def main() -> None:
     console = Console()
     base_url = args.url.rstrip("/")
 
-    try:
-        with Live(
-            build_display(base_url, get_system_stats()),
-            console=console,
-            refresh_per_second=1,
-            screen=True,
-        ) as live:
-            while True:
-                time.sleep(args.interval)
-                live.update(build_display(base_url, get_system_stats()))
-    except KeyboardInterrupt:
-        pass
+    selected = 0
+    detail_model: str | None = None
+    model_list: list[dict] = []
+
+    with RawInput():
+        try:
+            display, model_list = build_display(base_url, get_system_stats(), selected, detail_model)
+            with Live(display, console=console, refresh_per_second=2, screen=True) as live:
+                last_refresh = time.time()
+                while True:
+                    # Poll for keypress (non-blocking)
+                    key = None
+                    # Use a short sleep to avoid busy-waiting
+                    time.sleep(0.05)
+
+                    # Check for raw input
+                    try:
+                        if select.select([sys.stdin], [], [], 0)[0]:
+                            ch = sys.stdin.read(1)
+                            if ch == "\x1b":
+                                if select.select([sys.stdin], [], [], 0.05)[0]:
+                                    ch += sys.stdin.read(1)
+                                    if select.select([sys.stdin], [], [], 0.05)[0]:
+                                        ch += sys.stdin.read(1)
+                            key = ch
+                    except Exception:
+                        pass
+
+                    needs_update = False
+
+                    if key == KEY_CTRL_C:
+                        break
+                    elif key in (KEY_Q, KEY_ESC) and detail_model is not None:
+                        detail_model = None
+                        needs_update = True
+                    elif key in (KEY_Q,) and detail_model is None:
+                        break
+                    elif key == KEY_ESC and detail_model is None:
+                        break
+                    elif key in (KEY_UP, KEY_K) and detail_model is None:
+                        if model_list:
+                            selected = (selected - 1) % len(model_list)
+                            needs_update = True
+                    elif key in (KEY_DOWN, KEY_J) and detail_model is None:
+                        if model_list:
+                            selected = (selected + 1) % len(model_list)
+                            needs_update = True
+                    elif key == KEY_ENTER and detail_model is None:
+                        if model_list and 0 <= selected < len(model_list):
+                            detail_model = model_list[selected].get("id")
+                            needs_update = True
+
+                    # Periodic refresh
+                    now = time.time()
+                    if now - last_refresh >= args.interval:
+                        needs_update = True
+                        last_refresh = now
+
+                    if needs_update:
+                        sys_stats = get_system_stats()
+                        display, model_list = build_display(
+                            base_url, sys_stats, selected, detail_model,
+                        )
+                        # Clamp selection to list bounds
+                        if model_list:
+                            selected = min(selected, len(model_list) - 1)
+                        live.update(display)
+
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

@@ -114,17 +114,20 @@ class RawInput:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
 
     def read_key(self) -> str | None:
-        """Read a keypress if available. Returns None if no key is pending."""
-        if not select.select([sys.stdin], [], [], 0)[0]:
+        """Read a keypress if available. Returns None if no key is pending.
+
+        Uses os.read() on the raw file descriptor to avoid Python-level
+        buffering conflicts with cbreak mode and Rich's Live display.
+        """
+        if not select.select([self._fd], [], [], 0)[0]:
             return None
-        ch = sys.stdin.read(1)
+        ch = os.read(self._fd, 1).decode("utf-8", errors="ignore")
         if ch == "\x1b":
             # Escape sequence (arrow keys, etc.)
-            if select.select([sys.stdin], [], [], 0.05)[0]:
-                ch += sys.stdin.read(1)
-                if select.select([sys.stdin], [], [], 0.05)[0]:
-                    ch += sys.stdin.read(1)
-            return ch
+            if select.select([self._fd], [], [], 0.05)[0]:
+                ch += os.read(self._fd, 1).decode("utf-8", errors="ignore")
+                if select.select([self._fd], [], [], 0.05)[0]:
+                    ch += os.read(self._fd, 1).decode("utf-8", errors="ignore")
         return ch
 
 
@@ -633,29 +636,18 @@ def main() -> None:
     detail_model: str | None = None
     model_list: list[dict] = []
 
-    with RawInput():
+    raw_input = RawInput()
+    with raw_input:
         try:
             display, model_list = build_display(base_url, get_system_stats(), selected, detail_model)
             with Live(display, console=console, refresh_per_second=2, screen=True) as live:
                 last_refresh = time.time()
                 while True:
-                    # Poll for keypress (non-blocking)
-                    key = None
                     # Use a short sleep to avoid busy-waiting
                     time.sleep(0.05)
 
-                    # Check for raw input
-                    try:
-                        if select.select([sys.stdin], [], [], 0)[0]:
-                            ch = sys.stdin.read(1)
-                            if ch == "\x1b":
-                                if select.select([sys.stdin], [], [], 0.05)[0]:
-                                    ch += sys.stdin.read(1)
-                                    if select.select([sys.stdin], [], [], 0.05)[0]:
-                                        ch += sys.stdin.read(1)
-                            key = ch
-                    except Exception:
-                        pass
+                    # Poll for keypress (non-blocking)
+                    key = raw_input.read_key()
 
                     needs_update = False
 

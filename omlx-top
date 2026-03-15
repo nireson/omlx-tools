@@ -134,6 +134,7 @@ class RawInput:
 KEY_UP = "\x1b[A"
 KEY_DOWN = "\x1b[B"
 KEY_ENTER = "\r"
+KEY_NEWLINE = "\n"
 KEY_ESC = "\x1b"
 KEY_Q = "q"
 KEY_J = "j"
@@ -210,6 +211,56 @@ def get_system_stats() -> dict[str, Any]:
         pass
 
     return stats
+
+
+def get_recent_activity(model_name: str, max_lines: int = 15) -> list[str]:
+    """Parse the oMLX log for recent activity related to a specific model.
+
+    Returns a list of formatted log lines (most recent last).
+    """
+    log_path = Path(os.environ.get("OMLX_LOG", "/opt/homebrew/var/log/omlx.log"))
+    if not log_path.exists():
+        return []
+
+    lines: list[str] = []
+    try:
+        # Read last chunk of log (avoid reading entire file)
+        with open(log_path, "rb") as f:
+            # Seek to last 200KB
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 200_000))
+            raw = f.read().decode("utf-8", errors="ignore")
+
+        for line in raw.split("\n"):
+            if model_name not in line:
+                continue
+            # Filter to interesting log lines
+            if any(kw in line for kw in (
+                "Chat completion:",
+                "completion request received",
+                "Loading model",
+                "Loaded model",
+                "paged cache hit",
+                "tokens in",
+            )):
+                # Extract timestamp and message
+                parts = line.split(" - ", 2)
+                if len(parts) >= 3:
+                    ts = parts[0].split(",")[0]  # drop milliseconds
+                    # Shorten timestamp to HH:MM:SS
+                    if " " in ts:
+                        ts = ts.split(" ")[-1]
+                    msg = parts[2].strip()
+                    # Clean up common prefixes
+                    msg = msg.replace("Chat completion request received: ", "req: ")
+                    msg = msg.replace("Chat completion: ", "done: ")
+                    msg = msg.replace(f"model={model_name}, ", "")
+                    lines.append(f"[dim]{ts}[/] {msg}")
+    except Exception:
+        pass
+
+    return lines[-max_lines:]
 
 
 def load_model_stats() -> dict[str, Any]:
@@ -544,10 +595,20 @@ def build_detail_view(
         avg_tokens = ct / reqs
         info.add_row("Avg Tokens/Request", f"{avg_tokens:.0f}")
 
+    # Activity log from oMLX log file
+    activity = get_recent_activity(name)
+    activity_text = Text()
+    if activity:
+        for line in activity:
+            activity_text.append_text(Text.from_markup(line + "\n"))
+    else:
+        activity_text.append("No recent activity", style="dim")
+
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=10),
         Layout(name="detail"),
+        Layout(name="activity"),
     )
     layout["header"].update(build_header(status, sys_stats))
     layout["detail"].update(
@@ -555,7 +616,15 @@ def build_detail_view(
             info,
             title=f"[bold cyan]{name}[/] [dim]esc/q back[/]",
             border_style="cyan",
-            padding=(1, 2),
+            padding=(0, 2),
+        )
+    )
+    layout["activity"].update(
+        Panel(
+            activity_text,
+            title="[bold]Recent Activity[/]",
+            border_style="bright_black",
+            padding=(0, 1),
         )
     )
     return layout
@@ -664,7 +733,7 @@ def main() -> None:
                         if model_list:
                             selected = (selected + 1) % len(model_list)
                             needs_update = True
-                    elif key == KEY_ENTER and detail_model is None:
+                    elif key in (KEY_ENTER, KEY_NEWLINE) and detail_model is None:
                         if model_list and 0 <= selected < len(model_list):
                             detail_model = model_list[selected].get("id")
                             needs_update = True

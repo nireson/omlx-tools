@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
-"""omlx-top — live TUI dashboard for oMLX server."""
+"""omlx-top — live TUI dashboard for oMLX server.
+
+Requires macOS (Apple Silicon) and the ``rich`` Python package.
+"""
 
 import argparse
+import json
+import os
 import plistlib
-import signal
 import subprocess
 import sys
 import time
 import urllib.request
-import json
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, Union
 
-from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
-from rich.layout import Layout
-from rich.text import Text
 from rich import box
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 
-def fetch_json(url: str, timeout: float = 2.0):
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def fetch_json(url: str, timeout: float = 2.0) -> dict | None:
+    """Fetch JSON from *url*, returning ``None`` on any failure."""
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return json.loads(r.read())
@@ -30,6 +39,7 @@ def fetch_json(url: str, timeout: float = 2.0):
 
 
 def fmt_bytes(n: int) -> str:
+    """Format a byte count as a human-readable string."""
     if n >= 1 << 30:
         return f"{n / (1 << 30):.1f} GB"
     if n >= 1 << 20:
@@ -38,6 +48,8 @@ def fmt_bytes(n: int) -> str:
 
 
 def fmt_duration(seconds: float) -> str:
+    """Format a duration in seconds as a compact human-readable string."""
+    seconds = max(0, seconds)  # guard against negative values
     d = timedelta(seconds=int(seconds))
     days = d.days
     hours, rem = divmod(d.seconds, 3600)
@@ -50,12 +62,15 @@ def fmt_duration(seconds: float) -> str:
 
 
 def fmt_tps(tps: float) -> str:
+    """Format tokens-per-second, returning ``-`` for zero."""
     if tps == 0:
         return "-"
     return f"{tps:.1f}"
 
 
-def make_bar(pct: float, width: int = 20, thresholds=(60, 85)) -> Text:
+def make_bar(pct: float, width: int = 20, thresholds: tuple = (60, 85)) -> Text:
+    """Render a progress bar as a Rich ``Text`` object."""
+    pct = max(0.0, min(100.0, pct))  # clamp to 0-100
     filled = int(width * pct / 100)
     color = "green" if pct < thresholds[0] else "yellow" if pct < thresholds[1] else "red"
     bar = Text()
@@ -66,9 +81,17 @@ def make_bar(pct: float, width: int = 20, thresholds=(60, 85)) -> Text:
     return bar
 
 
-def get_system_stats() -> dict:
-    """Get CPU, GPU, and memory stats from macOS APIs."""
-    stats = {}
+# ---------------------------------------------------------------------------
+# System stats (macOS-only)
+# ---------------------------------------------------------------------------
+
+def get_system_stats() -> dict[str, Any]:
+    """Collect CPU, GPU, and memory stats from macOS APIs.
+
+    Returns a dict with best-effort values; missing keys indicate that the
+    corresponding data source was unavailable.
+    """
+    stats: dict[str, Any] = {}
 
     # CPU usage via top (single snapshot)
     try:
@@ -104,40 +127,45 @@ def get_system_stats() -> dict:
             ps = item.get("PerformanceStatistics", {})
             if ps:
                 stats["gpu_util"] = ps.get("Device Utilization %", 0)
-                stats["gpu_renderer"] = ps.get("Renderer Utilization %", 0)
-                stats["gpu_tiler"] = ps.get("Tiler Utilization %", 0)
                 stats["gpu_alloc"] = ps.get("Alloc system memory", 0)
-                stats["gpu_in_use"] = ps.get("In use system memory", 0)
                 break
     except Exception:
         pass
 
-    # System memory via vm_stat
+    # System memory — prefer sysctl for total, vm_stat for breakdown
     try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
         r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=3)
-        page_size = 16384  # Apple Silicon default
-        pages = {}
+        pages: dict[str, int] = {}
         for line in r.stdout.split("\n"):
-            if "page size of" in line:
-                page_size = int(line.split()[-2])
             for key in ("free", "active", "inactive", "wired", "compressor"):
                 if key in line.lower() and ":" in line:
                     val = line.split(":")[1].strip().rstrip(".")
                     pages[key] = int(val)
-        total_pages = sum(pages.values())
-        used_pages = pages.get("active", 0) + pages.get("wired", 0)
-        stats["ram_total"] = total_pages * page_size
-        stats["ram_used"] = used_pages * page_size
-        stats["ram_pct"] = round(used_pages / total_pages * 100, 1) if total_pages else 0
+        used_pages = (
+            pages.get("active", 0)
+            + pages.get("wired", 0)
+            + pages.get("compressor", 0)
+        )
+        # Total RAM from sysctl (more reliable than summing vm_stat categories)
+        r2 = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"],
+            capture_output=True, text=True, timeout=3,
+        )
+        total_bytes = int(r2.stdout.strip())
+        used_bytes = used_pages * page_size
+        stats["ram_total"] = total_bytes
+        stats["ram_used"] = used_bytes
+        stats["ram_pct"] = round(used_bytes / total_bytes * 100, 1) if total_bytes else 0
     except Exception:
         pass
 
     return stats
 
 
-def load_model_stats() -> dict:
-    """Load per-model stats from oMLX's persisted stats file."""
-    stats_path = Path.home() / ".omlx" / "stats.json"
+def load_model_stats() -> dict[str, Any]:
+    """Load per-model performance stats from oMLX's persisted stats file."""
+    stats_path = Path(os.environ.get("OMLX_HOME", Path.home() / ".omlx")) / "stats.json"
     try:
         with open(stats_path) as f:
             data = json.load(f)
@@ -146,14 +174,23 @@ def load_model_stats() -> dict:
         return {}
 
 
-def build_display(base_url: str, sys_stats: dict) -> Layout:
+# ---------------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------------
+
+def build_display(base_url: str, sys_stats: dict[str, Any]) -> Union[Layout, Panel]:
+    """Build the full dashboard layout for one refresh cycle."""
     status = fetch_json(f"{base_url}/api/status")
     models = fetch_json(f"{base_url}/v1/models/status")
     model_perf = load_model_stats()
 
     if not status:
         return Panel(
-            Text("Cannot connect to oMLX server", style="bold red", justify="center"),
+            Text(
+                f"Cannot connect to oMLX server at {base_url}",
+                style="bold red",
+                justify="center",
+            ),
             title="omlx-top",
             border_style="red",
         )
@@ -221,9 +258,8 @@ def build_display(base_url: str, sys_stats: dict) -> Layout:
     bars.add_column(ratio=1)
     bars.add_column(ratio=1)
 
-    # Model memory bar
     mem_used = status.get("model_memory_used", 0)
-    mem_max = status.get("model_memory_max", 1)
+    mem_max = status.get("model_memory_max", 0)
     mem_pct = mem_used / mem_max * 100 if mem_max else 0
     used_fmt = status.get("model_memory_used_formatted", "?").replace(" ", "")
     max_fmt = status.get("model_memory_max_formatted", "?").replace(" ", "")
@@ -233,7 +269,6 @@ def build_display(base_url: str, sys_stats: dict) -> Layout:
     model_mem_row.append(f" {used_fmt}", style="bold")
     model_mem_row.append(f"/{max_fmt}", style="dim")
 
-    # GPU bar
     gpu_pct = sys_stats.get("gpu_util", 0)
     gpu_row = Text()
     gpu_row.append("GPU    ", style="dim")
@@ -244,7 +279,6 @@ def build_display(base_url: str, sys_stats: dict) -> Layout:
 
     bars.add_row(model_mem_row, gpu_row)
 
-    # CPU bar + System RAM bar
     cpu_pct = sys_stats.get("cpu_used", 0)
     cpu_row = Text()
     cpu_row.append("CPU    ", style="dim")
@@ -300,10 +334,10 @@ def build_display(base_url: str, sys_stats: dict) -> Layout:
 
             name_style = "bold white" if is_loaded else "dim"
             size_style = "bold" if is_loaded else "dim"
-            dim = "dim" if not is_loaded else ""
+            row_style = "dim" if not is_loaded else None
 
-            if last:
-                elapsed = time.time() - last
+            if isinstance(last, (int, float)):
+                elapsed = max(0, time.time() - last)
                 last_str = fmt_duration(elapsed) + " ago"
             else:
                 last_str = "-"
@@ -329,11 +363,11 @@ def build_display(base_url: str, sys_stats: dict) -> Layout:
                 Text(name, style=name_style),
                 status_text,
                 Text(size, style=size_style),
-                Text(reqs_str, style=dim),
-                Text(prefill_str, style=dim),
-                Text(gen_str, style=dim),
-                Text(tokens_str, style=dim),
-                Text(last_str, style=dim),
+                Text(reqs_str, style=row_style),
+                Text(prefill_str, style=row_style),
+                Text(gen_str, style=row_style),
+                Text(tokens_str, style=row_style),
+                Text(last_str, style=row_style),
             )
 
     # --- Compose layout ---
@@ -360,16 +394,34 @@ def build_display(base_url: str, sys_stats: dict) -> Layout:
     return layout
 
 
-def main():
-    parser = argparse.ArgumentParser(description="omlx-top — live dashboard for oMLX server")
-    parser.add_argument("--url", default="http://localhost:11435", help="oMLX server URL")
-    parser.add_argument("-n", "--interval", type=float, default=2.0, help="Refresh interval in seconds")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Entry point."""
+    if sys.platform != "darwin":
+        print("omlx-top requires macOS (Apple Silicon)", file=sys.stderr)
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(
+        description="omlx-top — live TUI dashboard for oMLX server",
+    )
+    parser.add_argument(
+        "--url",
+        default="http://localhost:11435",
+        help="oMLX server URL (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-n", "--interval",
+        type=float,
+        default=2.0,
+        help="Refresh interval in seconds (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     console = Console()
     base_url = args.url.rstrip("/")
-
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
     try:
         with Live(
@@ -380,8 +432,7 @@ def main():
         ) as live:
             while True:
                 time.sleep(args.interval)
-                sys_stats = get_system_stats()
-                live.update(build_display(base_url, sys_stats))
+                live.update(build_display(base_url, get_system_stats()))
     except KeyboardInterrupt:
         pass
 

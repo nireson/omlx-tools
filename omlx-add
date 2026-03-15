@@ -16,10 +16,21 @@ set -euo pipefail
 MODELS_DIR="${OMLX_MODELS_DIR:-$HOME/.omlx/models}"
 CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface/hub}"
 
-if [[ $# -lt 1 ]]; then
-    echo "Usage: omlx-add <model-path> [--no-restart]"
-    echo "  e.g. omlx-add mlx-community/Qwen3-8B-4bit"
-    exit 1
+# --- Argument handling ---
+
+if [[ $# -lt 1 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
+    echo "Usage: omlx-add <org/model> [--no-restart]"
+    echo ""
+    echo "Download an MLX model from HuggingFace and register it with oMLX."
+    echo ""
+    echo "Examples:"
+    echo "  omlx-add mlx-community/Qwen3-8B-4bit"
+    echo "  omlx-add mlx-community/some-model --no-restart"
+    echo ""
+    echo "Environment variables:"
+    echo "  OMLX_MODELS_DIR  Model directory (default: ~/.omlx/models)"
+    echo "  HF_CACHE_DIR     HuggingFace cache (default: ~/.cache/huggingface/hub)"
+    if [[ $# -ge 1 ]]; then exit 0; else exit 1; fi
 fi
 
 MODEL_PATH="$1"
@@ -28,44 +39,73 @@ if [[ "${2:-}" == "--no-restart" ]]; then
     RESTART=false
 fi
 
-# Extract the short name (everything after the /)
-MODEL_NAME="${MODEL_PATH#*/}"
+# --- Validate input ---
 
-# HuggingFace cache uses -- as separator for org/model
-CACHE_NAME="models--$(echo "$MODEL_PATH" | tr '/' '--')"
-
-echo "Downloading $MODEL_PATH..."
-hf download "$MODEL_PATH"
-
-# Find the snapshot hash
-SNAPSHOTS_DIR="$CACHE_DIR/$CACHE_NAME/snapshots"
-if [[ ! -d "$SNAPSHOTS_DIR" ]]; then
-    echo "Error: snapshot directory not found at $SNAPSHOTS_DIR"
+if [[ "$MODEL_PATH" != */* ]]; then
+    echo "Error: model path must be in 'org/model' format (e.g., mlx-community/Qwen3-8B-4bit)" >&2
     exit 1
 fi
 
-HASH=$(ls "$SNAPSHOTS_DIR" | head -1)
+# Extract the short name (everything after the first /)
+MODEL_NAME="${MODEL_PATH#*/}"
+
+if [[ "$MODEL_NAME" == *..* ]] || [[ "$MODEL_NAME" == /* ]]; then
+    echo "Error: invalid model name '$MODEL_NAME'" >&2
+    exit 1
+fi
+
+# --- Download ---
+
+echo "Downloading $MODEL_PATH..."
+if ! hf download "$MODEL_PATH"; then
+    echo "Error: failed to download $MODEL_PATH" >&2
+    echo "Check that the model exists and you have network access." >&2
+    echo "Some models require authentication: run 'huggingface-cli login' first." >&2
+    exit 1
+fi
+
+# --- Find snapshot ---
+
+# HuggingFace cache uses -- (double dash) as separator for org/model
+CACHE_NAME="models--${MODEL_PATH/\//--}"
+SNAPSHOTS_DIR="$CACHE_DIR/$CACHE_NAME/snapshots"
+
+if [[ ! -d "$SNAPSHOTS_DIR" ]]; then
+    echo "Error: snapshot directory not found at $SNAPSHOTS_DIR" >&2
+    exit 1
+fi
+
+# Use most recently modified snapshot if multiple exist
+SNAPSHOT_COUNT=$(find "$SNAPSHOTS_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+if [[ "$SNAPSHOT_COUNT" -gt 1 ]]; then
+    echo "Warning: $SNAPSHOT_COUNT snapshots found, using most recent" >&2
+fi
+
+HASH=$(ls -t "$SNAPSHOTS_DIR" | head -1)
 if [[ -z "$HASH" ]]; then
-    echo "Error: no snapshot found"
+    echo "Error: no snapshot found in $SNAPSHOTS_DIR" >&2
     exit 1
 fi
 
 SNAPSHOT_PATH="$SNAPSHOTS_DIR/$HASH"
 
-# Create symlink
+# --- Create symlink ---
+
 mkdir -p "$MODELS_DIR"
 if [[ -L "$MODELS_DIR/$MODEL_NAME" ]]; then
     echo "Updating existing symlink for $MODEL_NAME"
     rm "$MODELS_DIR/$MODEL_NAME"
 elif [[ -e "$MODELS_DIR/$MODEL_NAME" ]]; then
-    echo "Error: $MODELS_DIR/$MODEL_NAME exists and is not a symlink"
+    echo "Error: $MODELS_DIR/$MODEL_NAME exists and is not a symlink" >&2
     exit 1
 fi
 
 ln -s "$SNAPSHOT_PATH" "$MODELS_DIR/$MODEL_NAME"
 echo "Linked $MODEL_NAME -> $SNAPSHOT_PATH"
 
-if $RESTART; then
+# --- Restart ---
+
+if [[ "$RESTART" == true ]]; then
     if command -v brew &>/dev/null && brew services list 2>/dev/null | grep -q omlx; then
         echo "Restarting oMLX..."
         brew services restart jundot/omlx/omlx

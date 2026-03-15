@@ -94,7 +94,11 @@ def make_bar(pct: float, width: int = 20, thresholds: tuple = (60, 85)) -> Text:
 # ---------------------------------------------------------------------------
 
 class RawInput:
-    """Non-blocking keyboard reader using raw terminal mode."""
+    """Non-blocking keyboard reader using cbreak terminal mode.
+
+    Uses cbreak (not raw) so that terminal output processing (newlines,
+    carriage returns, cursor movement) still works correctly with Rich.
+    """
 
     def __init__(self):
         self._fd = sys.stdin.fileno()
@@ -102,7 +106,7 @@ class RawInput:
 
     def __enter__(self):
         self._old_settings = termios.tcgetattr(self._fd)
-        tty.setraw(self._fd)
+        tty.setcbreak(self._fd)
         return self
 
     def __exit__(self, *_):
